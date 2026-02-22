@@ -8,13 +8,18 @@ Provides three tools for Philadelphia transit information:
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated
 
 import httpx
 from fastmcp import Context, FastMCP
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from config import (
     DEFAULT_ARRIVALS_COUNT,
@@ -58,17 +63,24 @@ mcp = FastMCP(
     name="SEPTA Transit Helper",
     instructions=(
         "Real-time SEPTA transit information for Philadelphia.\n\n"
-        "TOOLS:\n"
-        "- get_departure_options: plan trips between Regional Rail stations\n"
-        "- station_departures: see upcoming trains at a station\n"
-        "- check_status: check alerts and delays on any route\n\n"
-        "DATA HONESTY:\n"
-        "- All delay numbers come directly from SEPTA's API\n"
-        "- If data is scheduled (not real-time), say so\n"
-        "- If an API call fails, say so and show scheduled data only\n"
-        "- Absence of alerts does NOT mean on-time service\n"
-        "- Bus routes have real-time delay data per vehicle\n"
-        "- Subway (BSL/MFL) has alerts only, no real-time train positions"
+        "TOOL SELECTION:\n"
+        "- get_departure_options: Use for ANY trip-planning question ('how do I get "
+        "from A to B?', 'I need to be at X by 3 PM'). Always set arrive_by when "
+        "the user has a deadline.\n"
+        "- station_departures: Use ONLY when someone is physically at a station and "
+        "wants to see what's coming next ('I'm at 30th Street, what's leaving?').\n"
+        "- check_status: Use for alerts, delays, and service disruptions on any route.\n\n"
+        "RULES:\n"
+        "- NEVER tell users to check the SEPTA app or Google Maps. You have real-time "
+        "data — use it.\n"
+        "- If the results don't cover the user's time window, call the tool again "
+        "with count=10.\n"
+        "- All delay numbers come directly from SEPTA's API.\n"
+        "- If data is scheduled (not real-time), say so.\n"
+        "- If an API call fails, say so and show scheduled data only.\n"
+        "- Absence of alerts does NOT mean on-time service.\n"
+        "- Bus routes have real-time delay data per vehicle.\n"
+        "- Subway (BSL/MFL) has alerts only, no real-time train positions."
     ),
     lifespan=app_lifespan,
 )
@@ -89,9 +101,10 @@ async def get_departure_options(
 ) -> dict:
     """Plan ahead: find the next trains between two Regional Rail stations.
 
-    Use when someone asks "When should I leave?" or "What are my options
-    to get from A to B?" Returns ranked options with real-time delays,
-    travel times, and recommendations.
+    Use for ANY question about getting from A to B, including 'I need to
+    arrive by X'. Always set arrive_by when the user mentions a deadline.
+    Returns ranked options with real-time delays, travel times, and
+    recommendations.
 
     Station names are fuzzy-matched — 'suburban', '30th st', 'market east'
     all work.
@@ -389,12 +402,194 @@ async def _bus_route_status(
 
 
 # ---------------------------------------------------------------------------
+# Test endpoints (artifact sandbox connectivity test)
+# ---------------------------------------------------------------------------
+
+KOYEB_URL = "https://very-rozina-alexs-tools-d0f09f6b.koyeb.app"
+
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+}
+
+
+async def test_rest_handler(request: Request) -> Response:
+    """REST endpoint with CORS — tests fetch() from artifact sandbox."""
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_CORS_HEADERS)
+    return JSONResponse(
+        {
+            "ok": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": "fetch works!",
+        },
+        headers=_CORS_HEADERS,
+    )
+
+
+async def test_page_handler(request: Request) -> Response:
+    """HTML page — tests iframe embedding from artifact sandbox."""
+    html = """\
+<!DOCTYPE html>
+<html>
+<head><title>SEPTA MCP Iframe Test</title></head>
+<body style="font-family: system-ui; padding: 20px; background: #f8f9fa;">
+    <h1 style="color: #2e7d32;">Iframe works!</h1>
+    <p>If you can see this, the iframe loaded successfully from Koyeb.</p>
+    <p id="clock" style="font-size: 1.2em; font-weight: bold;"></p>
+    <script>
+        setInterval(function() {
+            document.getElementById('clock').textContent =
+                'Current time: ' + new Date().toLocaleTimeString();
+        }, 1000);
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+async def test_ws_handler(websocket: WebSocket) -> None:
+    """WebSocket endpoint — tests WS connectivity from artifact sandbox."""
+    await websocket.accept()
+    tick = 0
+    try:
+        while True:
+            tick += 1
+            await websocket.send_json(
+                {
+                    "tick": tick,
+                    "time": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await asyncio.sleep(3)
+    except (WebSocketDisconnect, Exception):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Tool 4: artifact_sandbox_test
+# ---------------------------------------------------------------------------
+
+_SANDBOX_TEST_COMPONENT = """\
+import { useState, useEffect } from 'react';
+
+export default function SandboxTest() {
+  const SERVER = '""" + KOYEB_URL + """';
+  const WS_SERVER = SERVER.replace('https://', 'wss://');
+
+  const [fetchResult, setFetchResult] = useState('Testing...');
+  const [wsResult, setWsResult] = useState('Testing...');
+  const [iframeStatus, setIframeStatus] = useState('Waiting...');
+
+  useEffect(() => {
+    // Test 1: fetch()
+    fetch(SERVER + '/api/test')
+      .then(r => r.json())
+      .then(data => setFetchResult('SUCCESS: ' + JSON.stringify(data)))
+      .catch(err => setFetchResult('BLOCKED: ' + err.message));
+
+    // Test 3: WebSocket
+    try {
+      const ws = new WebSocket(WS_SERVER + '/ws/test');
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        setWsResult('SUCCESS: tick=' + data.tick + ' time=' + data.time);
+      };
+      ws.onerror = () => setWsResult('BLOCKED: WebSocket connection failed');
+      ws.onclose = (e) => setWsResult(prev =>
+        prev.startsWith('SUCCESS') ? prev : 'BLOCKED: WebSocket closed (code=' + e.code + ')'
+      );
+      return () => ws.close();
+    } catch (err) {
+      setWsResult('BLOCKED: ' + err.message);
+    }
+  }, []);
+
+  const boxStyle = (result) => ({
+    padding: '12px 16px',
+    borderRadius: 8,
+    fontFamily: 'monospace',
+    fontSize: 14,
+    marginBottom: 8,
+    background: result.startsWith('SUCCESS') ? '#e8f5e9' : result === 'Testing...' || result === 'Waiting...' ? '#fff3e0' : '#ffebee',
+    border: '1px solid ' + (result.startsWith('SUCCESS') ? '#4caf50' : result === 'Testing...' || result === 'Waiting...' ? '#ff9800' : '#f44336'),
+  });
+
+  return (
+    <div style={{ fontFamily: 'system-ui', padding: 24, maxWidth: 700 }}>
+      <h2 style={{ marginTop: 0 }}>Artifact Sandbox Connectivity Test</h2>
+      <p style={{ color: '#666' }}>Server: {SERVER}</p>
+
+      <h3>Test 1: fetch()</h3>
+      <div style={boxStyle(fetchResult)}>{fetchResult}</div>
+
+      <h3>Test 2: iframe</h3>
+      <iframe
+        src={SERVER + '/test-page'}
+        style={{ width: '100%', height: 120, border: '1px solid #ccc', borderRadius: 8 }}
+        onLoad={() => setIframeStatus('SUCCESS: iframe onLoad fired')}
+        onError={() => setIframeStatus('BLOCKED: iframe failed to load')}
+      />
+      <div style={boxStyle(iframeStatus)}>{iframeStatus}</div>
+
+      <h3>Test 3: WebSocket</h3>
+      <div style={boxStyle(wsResult)}>{wsResult}</div>
+
+      <hr style={{ margin: '24px 0', border: 'none', borderTop: '1px solid #ddd' }} />
+      <p style={{ color: '#999', fontSize: 12 }}>
+        This artifact tests whether Claude's sandbox CSP allows network calls to external servers.
+        Each test shows SUCCESS (green) or BLOCKED (red).
+      </p>
+    </div>
+  );
+}
+"""
+
+
+@mcp.tool()
+async def artifact_sandbox_test() -> dict:
+    """Returns a React component that tests network connectivity from Claude's artifact sandbox.
+
+    Call this tool and render the returned component as a React artifact.
+    It tests fetch(), iframe, and WebSocket connections to our server.
+    """
+    return {
+        "artifact_type": "application/vnd.ant.react",
+        "title": "Sandbox Connectivity Test",
+        "component_source": _SANDBOX_TEST_COMPONENT,
+        "instructions": (
+            "Render the component_source above as a React artifact. "
+            "It tests whether fetch, iframe, and WebSocket connections "
+            "to our Koyeb server work from Claude's artifact sandbox."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     if transport == "http":
-        mcp.run(transport="http", host="0.0.0.0", port=8000)
+        from starlette.applications import Starlette
+        from starlette.routing import Mount, Route, WebSocketRoute
+
+        import uvicorn
+
+        mcp_app = mcp.http_app()
+
+        app = Starlette(
+            routes=[
+                Route("/api/test", test_rest_handler, methods=["GET", "OPTIONS"]),
+                Route("/test-page", test_page_handler),
+                WebSocketRoute("/ws/test", test_ws_handler),
+                Mount("/", mcp_app),
+            ],
+            lifespan=mcp_app.lifespan,
+        )
+
+        uvicorn.run(app, host="0.0.0.0", port=8000)
     else:
         mcp.run(transport="stdio")
