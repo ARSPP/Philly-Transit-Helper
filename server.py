@@ -9,9 +9,12 @@ Provides three tools for Philadelphia transit information:
 from __future__ import annotations
 
 import asyncio
+import html as html_mod
 import sys
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from string import Template
 from typing import Annotated
 
 import httpx
@@ -44,15 +47,21 @@ from septa_client import SeptaClient
 # Lifespan: shared httpx.AsyncClient
 # ---------------------------------------------------------------------------
 
+_rest_septa: SeptaClient | None = None
+
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
     """Create one httpx client for the entire server lifetime."""
+    global _rest_septa
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(HTTP_TIMEOUT),
         follow_redirects=True,
     ) as client:
-        yield {"septa": SeptaClient(client)}
+        septa = SeptaClient(client)
+        _rest_septa = septa
+        yield {"septa": septa}
+    _rest_septa = None
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +576,189 @@ async def artifact_sandbox_test() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Live departures board (iframe-based)
+# ---------------------------------------------------------------------------
+
+_BOARD_TEMPLATE = Template("""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="35">
+<title>SEPTA - $station</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0f1923;color:#e0e0e0;font-family:-apple-system,system-ui,'Segoe UI',sans-serif;padding:16px;min-height:100vh}
+.hdr{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;padding-bottom:10px;border-bottom:2px solid #2d3748}
+.hdr h1{font-size:17px;color:#fff;font-weight:600}
+.hdr .t{font-size:11px;color:#718096}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:6px 10px;font-size:10px;color:#718096;text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid #2d3748}
+td{padding:8px 10px;font-size:13px;border-bottom:1px solid #1a2332}
+tr:nth-child(even){background:#131f2e}
+.g{color:#48bb78}.y{color:#f6ad55}.r{color:#fc8181}.s{color:#a0aec0}
+.trk{font-weight:700;color:#63b3ed;text-align:center;min-width:28px}
+.dir{font-size:10px;color:#a0aec0;margin-left:4px}
+.dest{white-space:nowrap}
+.line{color:#a0aec0;font-size:12px}
+.ft{margin-top:14px;padding-top:10px;border-top:1px solid #2d3748;font-size:10px;color:#4a5568;display:flex;justify-content:space-between}
+.empty{text-align:center;padding:40px;color:#718096;font-size:14px}
+.err{text-align:center;padding:40px;color:#fc8181;font-size:14px}
+@media(max-width:500px){td,th{padding:6px 5px;font-size:12px}th{font-size:9px}.line{font-size:11px}}
+</style>
+</head>
+<body>
+<div class="hdr">
+<h1>$station</h1>
+<span class="t">$time</span>
+</div>
+$content
+<div class="ft"><span>Auto-refreshes every 30s</span><span>SEPTA Real-Time</span></div>
+<script>setTimeout(function(){location.reload()},30000)</script>
+</body>
+</html>""")
+
+
+def _render_board(station: str, departures: list) -> str:
+    """Render a full HTML departures board page."""
+    station_safe = html_mod.escape(station)
+    time_str = datetime.now().strftime("%I:%M:%S %p")
+
+    if not departures:
+        content = '<div class="empty">No upcoming departures found.<br>Service may have ended for the day.</div>'
+        return _BOARD_TEMPLATE.substitute(
+            station=station_safe, time=time_str, content=content
+        )
+
+    rows: list[str] = []
+    for d in departures:
+        delay = d.delay_minutes
+        if delay is not None and delay == 0:
+            cls = "g"
+        elif delay is not None and delay <= 5:
+            cls = "y"
+        elif delay is not None and delay > 5:
+            cls = "r"
+        else:
+            cls = "s"
+
+        arrow = ""
+        if d.direction == "N":
+            arrow = '<span class="dir">&#x2191;</span>'
+        elif d.direction == "S":
+            arrow = '<span class="dir">&#x2193;</span>'
+
+        rows.append(
+            f"<tr>"
+            f'<td>{html_mod.escape(d.scheduled_time or "")}</td>'
+            f'<td class="dest">{html_mod.escape(d.destination or "")}{arrow}</td>'
+            f'<td class="line">{html_mod.escape(d.line or "")}</td>'
+            f'<td class="{cls}">{html_mod.escape(d.delay_text or "Scheduled")}</td>'
+            f'<td class="trk">{html_mod.escape(d.track or "—")}</td>'
+            f"</tr>"
+        )
+
+    content = (
+        "<table><thead><tr>"
+        "<th>Time</th><th>Destination</th><th>Line</th><th>Status</th><th>Trk</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+    return _BOARD_TEMPLATE.substitute(
+        station=station_safe, time=time_str, content=content
+    )
+
+
+def _render_board_error(message: str) -> str:
+    """Render a board page with an error message."""
+    return _BOARD_TEMPLATE.substitute(
+        station="SEPTA Departures",
+        time=datetime.now().strftime("%I:%M:%S %p"),
+        content=f'<div class="err">{html_mod.escape(message)}</div>',
+    )
+
+
+async def board_handler(request: Request) -> Response:
+    """Server-rendered live departures board page."""
+    station = request.query_params.get("station", "")
+    if not station:
+        return HTMLResponse(_render_board_error("No station specified. Use ?station=Suburban+Station"))
+
+    if _rest_septa is None:
+        return HTMLResponse(_render_board_error("Server starting up..."), status_code=503)
+
+    resolved, _ = resolve_station_name(station)
+    direction = request.query_params.get("direction")
+
+    try:
+        arrivals = await _rest_septa.get_station_arrivals(resolved, 10, direction)
+    except Exception:
+        return HTMLResponse(_render_board_error(f"Could not reach SEPTA API for {resolved}"))
+
+    train_view = None
+    try:
+        train_view = await _rest_septa.get_train_view()
+    except Exception:
+        pass
+
+    departures = format_station_departures(arrivals, train_view)
+    return HTMLResponse(_render_board(resolved, departures))
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: live_board
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def live_board(
+    station: Annotated[str, "Station name (e.g. 'Suburban Station', 'suburban', '30th st')"],
+    ctx: Context = None,
+) -> dict:
+    """Show a live, auto-refreshing departures board for a station.
+
+    Returns an iframe-based artifact that displays real-time departures
+    with delay status, track numbers, and auto-refreshes every 30 seconds.
+    Render the component_source as a React artifact.
+    """
+    resolved, was_exact = resolve_station_name(station)
+    board_url = f"{KOYEB_URL}/board?station={urllib.parse.quote(resolved)}"
+
+    notes: list[str] = []
+    if not was_exact:
+        notes.append(f"Interpreted '{station}' as '{resolved}'")
+
+    component = (
+        "export default function DepartureBoard() {\n"
+        "  return (\n"
+        "    <iframe\n"
+        f'      src="{board_url}"\n'
+        '      style={{ width: "100%", height: "100%", border: "none" }}\n'
+        f'      title="SEPTA Departures - {resolved}"\n'
+        "    />\n"
+        "  );\n"
+        "}\n"
+    )
+
+    result: dict = {
+        "station": resolved,
+        "board_url": board_url,
+        "component_source": component,
+        "instructions": (
+            "Render the component_source as a React artifact to show the live "
+            "departures board. The board auto-refreshes every 30 seconds with "
+            "real-time SEPTA data. If the artifact iframe doesn't render, provide "
+            "the board_url as a direct link the user can open."
+        ),
+    }
+    if notes:
+        result["notes"] = notes
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -582,6 +774,7 @@ if __name__ == "__main__":
 
         app = Starlette(
             routes=[
+                Route("/board", board_handler),
                 Route("/api/test", test_rest_handler, methods=["GET", "OPTIONS"]),
                 Route("/test-page", test_page_handler),
                 WebSocketRoute("/ws/test", test_ws_handler),
