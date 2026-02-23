@@ -182,15 +182,7 @@ async def get_departure_options(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(
-    app={
-        "resourceUri": "ui://departures/board.html",
-        "csp": {
-            "resourceDomains": ["https://esm.sh"],
-            "connectDomains": ["https://esm.sh"],
-        },
-    },
-)
+@mcp.tool(app={"resourceUri": "ui://departures/board.html"})
 async def station_departures(
     station: Annotated[str, "Station name (e.g. 'Suburban Station', 'suburban', '30th st')"],
     count: Annotated[int, Field(description="Departures per direction", ge=1, le=20)] = DEFAULT_ARRIVALS_COUNT,
@@ -478,17 +470,53 @@ tr:nth-child(even){background:#131f2e}
 <div id="content"><div class="loading">Waiting for data...</div></div>
 <div class="ft"><span>Auto-refreshes every 30s</span><span>SEPTA Real-Time</span></div>
 
-<script type="module">
-import { App } from "https://esm.sh/@modelcontextprotocol/ext-apps";
-
-const app = new App({ name: "SEPTA Departures Board", version: "1.0.0" });
-
+<script>
+// --- Minimal MCP Apps postMessage client (no external dependencies) ---
+let _id = 1;
+const _pending = {};
 let currentStation = null;
 
+function _send(method, params) {
+  const id = _id++;
+  return new Promise(function(resolve, reject) {
+    _pending[id] = { resolve: resolve, reject: reject };
+    window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params }, "*");
+  });
+}
+
+window.addEventListener("message", function(e) {
+  const msg = e.data;
+  if (!msg || msg.jsonrpc !== "2.0") return;
+
+  // Response to a request we sent
+  if (msg.id && _pending[msg.id]) {
+    const cb = _pending[msg.id];
+    delete _pending[msg.id];
+    if (msg.error) cb.reject(msg.error);
+    else cb.resolve(msg.result);
+    return;
+  }
+
+  // Notification from host: initial tool result
+  if (msg.method === "ui/notifications/tool-result") {
+    const data = parseToolResult(msg.params);
+    if (data) render(data);
+  }
+});
+
+// --- UI helpers ---
 function esc(s) {
   const d = document.createElement("div");
   d.textContent = s;
   return d.innerHTML;
+}
+
+function parseToolResult(result) {
+  const text = (result.content || []).find(function(c) { return c.type === "text"; });
+  if (text && text.text) {
+    try { return JSON.parse(text.text); } catch(e) { return null; }
+  }
+  return null;
 }
 
 function render(data) {
@@ -514,7 +542,8 @@ function render(data) {
     '<th>Time</th><th>Destination</th><th>Line</th><th>Status</th><th>Trk</th>' +
     '</tr></thead><tbody>';
 
-  for (const d of deps) {
+  for (let i = 0; i < deps.length; i++) {
+    const d = deps[i];
     const dm = d.delay_minutes;
     const cls = dm != null && dm === 0 ? "g"
       : dm != null && dm <= 5 ? "y"
@@ -535,41 +564,18 @@ function render(data) {
   document.getElementById("content").innerHTML = html;
 }
 
-function parseToolResult(result) {
-  const text = (result.content || []).find(function(c) { return c.type === "text"; });
-  if (text && text.text) {
-    try { return JSON.parse(text.text); } catch(e) { return null; }
-  }
-  return null;
-}
+// --- Initialize handshake with MCP Apps host ---
+_send("ui/initialize", { name: "SEPTA Departures Board", version: "1.0.0" });
 
-// Receive initial tool result from the host
-app.ontoolresult = function(result) {
-  const data = parseToolResult(result);
-  if (data) render(data);
-};
-
-app.onerror = function(err) {
-  document.getElementById("content").innerHTML =
-    '<div class="err">Error: ' + esc(String(err)) + '</div>';
-};
-
-// Connect to the MCP Apps host
-app.connect();
-
-// Auto-poll every 30 seconds
-setInterval(async function() {
+// --- Auto-poll every 30 seconds ---
+setInterval(function() {
   if (!currentStation) return;
-  try {
-    const result = await app.callServerTool({
-      name: "poll_departures",
-      arguments: { station: currentStation }
-    });
-    const data = parseToolResult(result);
-    if (data) render(data);
-  } catch(e) {
-    // Silently retry next cycle
-  }
+  _send("tools/call", { name: "poll_departures", arguments: { station: currentStation } })
+    .then(function(result) {
+      const data = parseToolResult(result);
+      if (data) render(data);
+    })
+    .catch(function() { /* retry next cycle */ });
 }, 30000);
 </script>
 </body>
@@ -577,7 +583,7 @@ setInterval(async function() {
 """
 
 
-@mcp.resource("ui://departures/board.html")
+@mcp.resource("ui://departures/board.html", app=True)
 async def departures_board_ui() -> str:
     """Departures board MCP App UI."""
     return _BOARD_HTML
