@@ -565,7 +565,18 @@ function render(data) {
 }
 
 // --- Initialize handshake with MCP Apps host ---
-_send("ui/initialize", { name: "SEPTA Departures Board", version: "1.0.0" });
+_send("ui/initialize", {
+  protocolVersion: "2026-01-26",
+  appInfo: { name: "SEPTA Departures Board", version: "1.0.0" },
+  appCapabilities: {}
+}).then(function() {
+  // Send required "initialized" notification (no id = notification)
+  window.parent.postMessage({
+    jsonrpc: "2.0",
+    method: "ui/notifications/initialized",
+    params: {}
+  }, "*");
+});
 
 // --- Auto-poll every 30 seconds ---
 setInterval(function() {
