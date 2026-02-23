@@ -594,7 +594,7 @@ setInterval(function() {
 """
 
 
-@mcp.resource("ui://departures/board.html", app=True)
+@mcp.resource("ui://departures/board.html", app={})
 async def departures_board_ui() -> str:
     """Departures board MCP App UI."""
     return _BOARD_HTML
