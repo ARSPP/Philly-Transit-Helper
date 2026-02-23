@@ -470,49 +470,19 @@ tr:nth-child(even){background:#131f2e}
 <div id="content"><div class="loading">Waiting for data...</div></div>
 <div class="ft"><span>Auto-refreshes every 30s</span><span>SEPTA Real-Time</span></div>
 
-<script>
-// --- Minimal MCP Apps postMessage client (no external dependencies) ---
-let _id = 1;
-const _pending = {};
+<script type="module">
+import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@0.4.0/app-with-deps";
+
 let currentStation = null;
 
-function _send(method, params) {
-  const id = _id++;
-  return new Promise(function(resolve, reject) {
-    _pending[id] = { resolve: resolve, reject: reject };
-    window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params }, "*");
-  });
-}
-
-window.addEventListener("message", function(e) {
-  const msg = e.data;
-  if (!msg || msg.jsonrpc !== "2.0") return;
-
-  // Response to a request we sent
-  if (msg.id && _pending[msg.id]) {
-    const cb = _pending[msg.id];
-    delete _pending[msg.id];
-    if (msg.error) cb.reject(msg.error);
-    else cb.resolve(msg.result);
-    return;
-  }
-
-  // Notification from host: initial tool result
-  if (msg.method === "ui/notifications/tool-result") {
-    const data = parseToolResult(msg.params);
-    if (data) render(data);
-  }
-});
-
-// --- UI helpers ---
 function esc(s) {
   const d = document.createElement("div");
   d.textContent = s;
   return d.innerHTML;
 }
 
-function parseToolResult(result) {
-  const text = (result.content || []).find(function(c) { return c.type === "text"; });
+function parseResult(result) {
+  const text = (result.content || []).find(c => c.type === "text");
   if (text && text.text) {
     try { return JSON.parse(text.text); } catch(e) { return null; }
   }
@@ -542,8 +512,7 @@ function render(data) {
     '<th>Time</th><th>Destination</th><th>Line</th><th>Status</th><th>Trk</th>' +
     '</tr></thead><tbody>';
 
-  for (let i = 0; i < deps.length; i++) {
-    const d = deps[i];
+  for (const d of deps) {
     const dm = d.delay_minutes;
     const cls = dm != null && dm === 0 ? "g"
       : dm != null && dm <= 5 ? "y"
@@ -564,29 +533,30 @@ function render(data) {
   document.getElementById("content").innerHTML = html;
 }
 
-// --- Initialize handshake with MCP Apps host ---
-_send("ui/initialize", {
-  protocolVersion: "2026-01-26",
-  appInfo: { name: "SEPTA Departures Board", version: "1.0.0" },
-  appCapabilities: {}
-}).then(function() {
-  // Send required "initialized" notification (no id = notification)
-  window.parent.postMessage({
-    jsonrpc: "2.0",
-    method: "ui/notifications/initialized",
-    params: {}
-  }, "*");
-});
+// --- MCP Apps SDK ---
+const app = new App({ name: "SEPTA Departures Board", version: "1.0.0" });
 
-// --- Auto-poll every 30 seconds ---
-setInterval(function() {
+// Set handlers BEFORE connect (per SDK best practices)
+app.ontoolresult = (result) => {
+  const data = parseResult(result);
+  if (data) render(data);
+};
+
+app.onerror = console.error;
+
+await app.connect();
+
+// Auto-poll every 30 seconds
+setInterval(async () => {
   if (!currentStation) return;
-  _send("tools/call", { name: "poll_departures", arguments: { station: currentStation } })
-    .then(function(result) {
-      const data = parseToolResult(result);
-      if (data) render(data);
-    })
-    .catch(function() { /* retry next cycle */ });
+  try {
+    const result = await app.callServerTool({
+      name: "poll_departures",
+      arguments: { station: currentStation }
+    });
+    const data = parseResult(result);
+    if (data) render(data);
+  } catch(e) { /* retry next cycle */ }
 }, 30000);
 </script>
 </body>
@@ -594,7 +564,10 @@ setInterval(function() {
 """
 
 
-@mcp.resource("ui://departures/board.html", app={})
+@mcp.resource(
+    "ui://departures/board.html",
+    app={"csp": {"resourceDomains": ["https://unpkg.com"]}},
+)
 async def departures_board_ui() -> str:
     """Departures board MCP App UI."""
     return _BOARD_HTML
@@ -607,6 +580,6 @@ async def departures_board_ui() -> str:
 if __name__ == "__main__":
     transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     if transport == "http":
-        mcp.run(transport="http", host="0.0.0.0", port=8000)
+        mcp.run(transport="http", host="0.0.0.0", port=8000, stateless_http=True)
     else:
         mcp.run(transport="stdio")
