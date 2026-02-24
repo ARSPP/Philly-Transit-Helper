@@ -21,6 +21,10 @@ CACHE_TTL_ALERTS = 120
 DEFAULT_DEPARTURE_COUNT = 10
 DEFAULT_ARRIVALS_COUNT = 10
 
+# GTFS static schedule data
+GTFS_RAIL_URL = "https://www3.septa.org/developer/google_rail.zip"
+GTFS_REFRESH_HOURS = 24
+
 # HTTP client settings
 HTTP_TIMEOUT = 15.0
 

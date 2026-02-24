@@ -184,3 +184,28 @@ class RailLineStatus(BaseModel):
     max_delay_minutes: int
     alerts: list[str] = Field(default_factory=list)
     train_details: list[dict] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# GTFS schedule output models
+# ---------------------------------------------------------------------------
+
+class ScheduledDeparture(BaseModel):
+    """A scheduled departure from GTFS (not real-time)."""
+
+    departure_time: str
+    destination: str
+    line: str
+    train_number: str | None = None
+    direction: str | None = None
+
+
+class ScheduledTrip(BaseModel):
+    """An A-to-B trip from GTFS (not real-time)."""
+
+    train_number: str | None = None
+    line: str
+    scheduled_departure: str
+    scheduled_arrival: str
+    travel_time_minutes: int | None = None
+    direction: str | None = None

@@ -33,6 +33,13 @@ from departure_logic import (
     rank_departure_options,
     resolve_station_name,
 )
+from gtfs_loader import GtfsData, load_gtfs
+from schedule_logic import (
+    lookup_schedule,
+    lookup_trip_schedule,
+    parse_date,
+    parse_time_to_seconds,
+)
 from septa_client import SeptaClient
 
 # ---------------------------------------------------------------------------
@@ -42,12 +49,17 @@ from septa_client import SeptaClient
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
-    """Create one httpx client for the entire server lifetime."""
+    """Create one httpx client and load GTFS for the entire server lifetime."""
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(HTTP_TIMEOUT),
         follow_redirects=True,
     ) as client:
-        yield {"septa": SeptaClient(client)}
+        septa = SeptaClient(client)
+        try:
+            gtfs = await load_gtfs(client)
+        except Exception:
+            gtfs = None  # schedule tools degrade gracefully
+        yield {"septa": septa, "gtfs": gtfs}
 
 
 # ---------------------------------------------------------------------------
@@ -61,9 +73,13 @@ mcp = FastMCP(
         "TOOL SELECTION:\n"
         "- get_departure_options: Use for ANY trip-planning question ('how do I get "
         "from A to B?', 'I need to be at X by 3 PM'). Always set arrive_by when "
-        "the user has a deadline.\n"
+        "the user has a deadline. Accepts an optional 'date' param for future dates "
+        "('tomorrow', 'next Monday', '2026-03-01').\n"
         "- station_departures: Use ONLY when someone is physically at a station and "
         "wants to see what's coming next ('I'm at 30th Street, what's leaving?').\n"
+        "- schedule_lookup: Use for schedule questions about future dates "
+        "('what trains leave Suburban tomorrow morning?', 'weekend schedule at "
+        "30th Street'). Returns published timetable data.\n"
         "- check_status: Use for alerts, delays, and service disruptions on any route.\n\n"
         "RULES:\n"
         "- NEVER tell users to check the SEPTA app or Google Maps. You have real-time "
@@ -71,7 +87,8 @@ mcp = FastMCP(
         "- If the results don't cover the user's time window, call the tool again "
         "with count=10.\n"
         "- All delay numbers come directly from SEPTA's API.\n"
-        "- If data is scheduled (not real-time), say so.\n"
+        "- If data is scheduled (not real-time), say so — this always applies to "
+        "future-date results from schedule_lookup and get_departure_options with date.\n"
         "- If an API call fails, say so and show scheduled data only.\n"
         "- Absence of alerts does NOT mean on-time service.\n"
         "- Bus routes have real-time delay data per vehicle.\n"
@@ -92,14 +109,16 @@ async def get_departure_options(
     destination: Annotated[str, "Ending station (e.g. 'Paoli', 'Thorndale', 'airport b')"],
     count: Annotated[int, Field(description="Number of options to show", ge=1, le=10)] = DEFAULT_DEPARTURE_COUNT,
     arrive_by: Annotated[str | None, "Target arrival time (e.g. '3:00 PM', '3:00PM'). Omit to just show next departures"] = None,
+    date: Annotated[str | None, "Date for the trip (e.g. 'tomorrow', 'next Monday', '2026-03-01'). Omit for today/real-time"] = None,
     ctx: Context = None,
 ) -> dict:
     """Plan ahead: find the next trains between two Regional Rail stations.
 
     Use for ANY question about getting from A to B, including 'I need to
     arrive by X'. Always set arrive_by when the user mentions a deadline.
-    Returns ranked options with real-time delays, travel times, and
-    recommendations.
+
+    For today: returns ranked options with real-time delays.
+    For future dates: returns published schedule data (set the date param).
 
     Station names are fuzzy-matched — 'suburban', '30th st', 'market east'
     all work.
@@ -114,6 +133,41 @@ async def get_departure_options(
         notes.append(f"Interpreted '{origin}' as '{resolved_origin}'")
     if not dest_exact:
         notes.append(f"Interpreted '{destination}' as '{resolved_dest}'")
+
+    # --- Future date: use GTFS schedule data ---
+    if date is not None:
+        import datetime as _dt
+
+        query_date = parse_date(date)
+        if query_date is None:
+            return {"error": f"Could not parse date: '{date}'. Try 'tomorrow', 'next Monday', or 'YYYY-MM-DD'."}
+
+        today = _dt.date.today()
+        if query_date <= today:
+            # Fall through to real-time for today/past dates
+            pass
+        else:
+            gtfs: GtfsData | None = ctx.lifespan_context.get("gtfs")
+            if gtfs is None:
+                return {"error": "Schedule data is not available. Try again later."}
+
+            time_after = parse_time_to_seconds(arrive_by) if arrive_by else None
+            trips = lookup_trip_schedule(
+                gtfs, resolved_origin, resolved_dest, query_date,
+                time_after=time_after, count=count,
+            )
+            result: dict = {
+                "origin": resolved_origin,
+                "destination": resolved_dest,
+                "date": query_date.strftime("%A, %B %-d, %Y"),
+                "data_freshness": "Published schedule (not real-time — delays not included)",
+                "options": [t.model_dump(exclude_none=True) for t in trips],
+            }
+            if not trips:
+                result["message"] = f"No scheduled trains found from {resolved_origin} to {resolved_dest} on {result['date']}."
+            if notes:
+                result["notes"] = notes
+            return result
 
     try:
         entries = await septa.get_next_to_arrive(
@@ -397,7 +451,73 @@ async def _bus_route_status(
 
 
 # ---------------------------------------------------------------------------
-# Tool 4: poll_departures (app-only — called by the departures board UI)
+# Tool 4: schedule_lookup
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def schedule_lookup(
+    station: Annotated[str, "Station name (e.g. 'Suburban Station', 'suburban', '30th st')"],
+    date: Annotated[str, "Date to look up (e.g. 'tomorrow', 'next Monday', '2026-03-01')"],
+    time_after: Annotated[str | None, "Show departures after this time (e.g. '8:00 AM')"] = None,
+    time_before: Annotated[str | None, "Show departures before this time (e.g. '9:00 AM')"] = None,
+    count: Annotated[int, Field(description="Number of departures to show", ge=1, le=30)] = 10,
+    ctx: Context = None,
+) -> dict:
+    """Look up the published train schedule for any future date.
+
+    Use when someone asks about tomorrow's trains, next week's schedule,
+    or any date beyond today. Returns the published SEPTA timetable.
+
+    For today's real-time data, use station_departures or
+    get_departure_options instead.
+    """
+    gtfs: GtfsData | None = ctx.lifespan_context.get("gtfs")
+    if gtfs is None:
+        return {"error": "Schedule data is not available. Try again later."}
+
+    query_date = parse_date(date)
+    if query_date is None:
+        return {"error": f"Could not parse date: '{date}'. Try 'tomorrow', 'next Monday', or 'YYYY-MM-DD'."}
+
+    resolved, was_exact = resolve_station_name(station)
+    notes: list[str] = []
+    if not was_exact:
+        notes.append(f"Interpreted '{station}' as '{resolved}'")
+
+    after_secs = parse_time_to_seconds(time_after) if time_after else None
+    before_secs = parse_time_to_seconds(time_before) if time_before else None
+
+    departures = lookup_schedule(
+        gtfs, resolved, query_date,
+        time_after=after_secs,
+        time_before=before_secs,
+        count=count,
+    )
+
+    result: dict = {
+        "station": resolved,
+        "date": query_date.strftime("%A, %B %-d, %Y"),
+        "data_freshness": "Published schedule (not real-time — delays not included)",
+        "departures": [d.model_dump(exclude_none=True) for d in departures],
+    }
+
+    if time_after:
+        result["time_filter_after"] = time_after
+    if time_before:
+        result["time_filter_before"] = time_before
+
+    if not departures:
+        result["message"] = f"No scheduled departures found at {resolved} on {result['date']}."
+
+    if notes:
+        result["notes"] = notes
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: poll_departures (app-only — called by the departures board UI)
 # ---------------------------------------------------------------------------
 
 
